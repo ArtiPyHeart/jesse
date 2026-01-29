@@ -1,6 +1,7 @@
 import peewee
 from jesse.services.db import database
 import jesse.helpers as jh
+from jesse.services import logger
 import numpy as np
 
 
@@ -65,17 +66,25 @@ def store_candle_into_db(exchange: str, symbol: str, timeframe: str, candle: np.
         'volume': candle[5]
     }
 
-    if on_conflict == 'ignore':
-        Candle.insert(**d).on_conflict_ignore().execute()
-    elif on_conflict == 'replace':
-        Candle.insert(**d).on_conflict(
-            conflict_target=['exchange', 'symbol', 'timeframe', 'timestamp'],
-            preserve=(Candle.open, Candle.high, Candle.low, Candle.close, Candle.volume),
-        ).execute()
-    elif on_conflict == 'error':
-        Candle.insert(**d).execute()
-    else:
+    def _exec():
+        if on_conflict == 'ignore':
+            return Candle.insert(**d).on_conflict_ignore().execute()
+        if on_conflict == 'replace':
+            return Candle.insert(**d).on_conflict(
+                conflict_target=['exchange', 'symbol', 'timeframe', 'timestamp'],
+                preserve=(Candle.open, Candle.high, Candle.low, Candle.close, Candle.volume),
+            ).execute()
+        if on_conflict == 'error':
+            return Candle.insert(**d).execute()
         raise Exception(f'Unknown on_conflict value: {on_conflict}')
+
+    try:
+        _exec()
+    except (peewee.OperationalError, peewee.InterfaceError) as exc:
+        # Force a reconnect once, then retry the write.
+        logger.error(f"Candle DB write failed, retry after reconnect: {exc}")
+        database.reconnect()
+        _exec()
 
 
 def store_candles_into_db(exchange: str, symbol: str, timeframe: str, candles: np.ndarray, on_conflict='ignore') -> None:
@@ -100,17 +109,24 @@ def store_candles_into_db(exchange: str, symbol: str, timeframe: str, candles: n
         }
         candles_list.append(d)
 
-    if on_conflict == 'ignore':
-        Candle.insert_many(candles_list).on_conflict_ignore().execute()
-    elif on_conflict == 'replace':
-        Candle.insert_many(candles_list).on_conflict(
-            conflict_target=['exchange', 'symbol', 'timeframe', 'timestamp'],
-            preserve=(Candle.open, Candle.high, Candle.low, Candle.close, Candle.volume),
-        ).execute()
-    elif on_conflict == 'error':
-        Candle.insert_many(candles_list).execute()
-    else:
+    def _exec():
+        if on_conflict == 'ignore':
+            return Candle.insert_many(candles_list).on_conflict_ignore().execute()
+        if on_conflict == 'replace':
+            return Candle.insert_many(candles_list).on_conflict(
+                conflict_target=['exchange', 'symbol', 'timeframe', 'timestamp'],
+                preserve=(Candle.open, Candle.high, Candle.low, Candle.close, Candle.volume),
+            ).execute()
+        if on_conflict == 'error':
+            return Candle.insert_many(candles_list).execute()
         raise Exception(f'Unknown on_conflict value: {on_conflict}')
+
+    try:
+        _exec()
+    except (peewee.OperationalError, peewee.InterfaceError) as exc:
+        logger.error(f"Bulk candle DB write failed, retry after reconnect: {exc}")
+        database.reconnect()
+        _exec()
 
 
 def fetch_candles_from_db(exchange: str, symbol: str, timeframe: str, start_date: int, finish_date: int) -> tuple:

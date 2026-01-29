@@ -1,5 +1,7 @@
 import peewee
 from jesse.services.db import database
+from jesse.services import logger
+import jesse.helpers as jh
 
 
 if database.is_closed():
@@ -56,4 +58,18 @@ def store_log_into_db(log: dict, log_type: str) -> None:
         'message': log['message']
     }
 
-    Log.insert(**d).execute()
+    try:
+        Log.insert(**d).execute()
+    except (peewee.OperationalError, peewee.InterfaceError) as exc:
+        # Avoid infinite recursion by writing directly to the log file.
+        if 'log-db-errors' not in logger.LOGGERS:
+            logger.create_logger_file('log-db-errors')
+        logger.LOGGERS['log-db-errors'].error(
+            f"[LOG-DB-ERROR] {jh.timestamp_to_time(jh.now_to_timestamp())[:19]} {exc}"
+        )
+        database.reconnect()
+        try:
+            Log.insert(**d).execute()
+        except (peewee.OperationalError, peewee.InterfaceError):
+            # Final fallback: ignore to keep live process running.
+            return
