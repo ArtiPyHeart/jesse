@@ -7,6 +7,7 @@ from jesse.enums import timeframes
 from jesse.exceptions import RouteNotFound
 from jesse.libs import DynamicNumpyArray
 from jesse.models.Candle import store_candle_into_db
+from jesse.services import heartbeat
 from jesse.services.candle import generate_candle_from_one_minutes
 from timeloop import Timeloop
 from datetime import timedelta
@@ -36,7 +37,7 @@ class CandlesState:
                 return
 
             for c in selectors.get_all_routes():
-                exchange, symbol, timeframe = c['exchange'], c['symbol'], c['timeframe']
+                exchange, symbol, timeframe = c["exchange"], c["symbol"], c["timeframe"]
                 current_candle = self.get_current_candle(exchange, symbol, timeframe)
 
                 # fix for a bug
@@ -47,15 +48,16 @@ class CandlesState:
                 # last one this is useful when the exchange doesn't stream an empty
                 # candle when no volume is traded at the period of the candle
                 if jh.next_candle_timestamp(current_candle, timeframe) < jh.now():
-                    new_candle = self._generate_empty_candle_from_previous_candle(current_candle, timeframe=timeframe)
+                    new_candle = self._generate_empty_candle_from_previous_candle(
+                        current_candle, timeframe=timeframe
+                    )
                     self.add_candle(new_candle, exchange, symbol, timeframe)
 
         t.start()
 
     @staticmethod
     def _generate_empty_candle_from_previous_candle(
-            previous_candle: np.ndarray,
-            timeframe: str = '1m'
+        previous_candle: np.ndarray, timeframe: str = "1m"
     ) -> np.ndarray:
         new_candle = previous_candle.copy()
         candles_count = jh.timeframe_to_one_minutes(timeframe) * 60_000
@@ -75,7 +77,9 @@ class CandlesState:
             self.initiated_pairs[k] = True
         self.are_all_initiated = True
 
-    def get_storage(self, exchange: str, symbol: str, timeframe: str) -> DynamicNumpyArray:
+    def get_storage(
+        self, exchange: str, symbol: str, timeframe: str
+    ) -> DynamicNumpyArray:
         key = jh.key(exchange, symbol, timeframe)
 
         try:
@@ -85,30 +89,33 @@ class CandlesState:
 
     def init_storage(self, bucket_size: int = 1000) -> None:
         for ar in selectors.get_all_routes():
-            exchange, symbol = ar['exchange'], ar['symbol']
+            exchange, symbol = ar["exchange"], ar["symbol"]
 
             # initiate the '1m' timeframes
             key = jh.key(exchange, symbol, timeframes.MINUTE_1)
             self.storage[key] = DynamicNumpyArray((bucket_size, 6))
 
-            for timeframe in config['app']['considering_timeframes']:
+            for timeframe in config["app"]["considering_timeframes"]:
                 key = jh.key(exchange, symbol, timeframe)
                 # ex: 1440 / 60 + 1 (reserve one for forming candle)
-                total_bigger_timeframe = int((bucket_size / jh.timeframe_to_one_minutes(timeframe)) + 1)
+                total_bigger_timeframe = int(
+                    (bucket_size / jh.timeframe_to_one_minutes(timeframe)) + 1
+                )
                 self.storage[key] = DynamicNumpyArray((total_bigger_timeframe, 6))
 
     def add_candle(
-            self,
-            candle: np.ndarray,
-            exchange: str,
-            symbol: str,
-            timeframe: str,
-            with_execution: bool = True,
-            with_generation: bool = True,
-            with_skip: bool = True
+        self,
+        candle: np.ndarray,
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        with_execution: bool = True,
+        with_generation: bool = True,
+        with_skip: bool = True,
     ) -> None:
+        should_heartbeat = False
         # overwrite with_generation based on the config value for live sessions
-        if jh.is_live() and not jh.get_config('env.data.generate_candles_from_1m'):
+        if jh.is_live() and not jh.get_config("env.data.generate_candles_from_1m"):
             with_generation = False
 
         if candle[0] == 0:
@@ -122,7 +129,7 @@ class CandlesState:
 
         if jh.is_live():
             # ignore if candle is still being initially imported
-            if with_skip and f'{exchange}-{symbol}' not in self.initiated_pairs:
+            if with_skip and f"{exchange}-{symbol}" not in self.initiated_pairs:
                 return
 
             # if it's not an old candle, update the related position's current_price
@@ -139,6 +146,7 @@ class CandlesState:
         # initial
         if len(arr) == 0:
             arr.append(candle)
+            should_heartbeat = True
 
         # if it's new, add
         elif candle[0] > arr[-1][0]:
@@ -147,10 +155,13 @@ class CandlesState:
                 self.simulate_order_execution(exchange, symbol, timeframe, candle)
 
             arr.append(candle)
+            should_heartbeat = True
 
             # generate other timeframes
-            if with_generation and timeframe == '1m':
-                self.generate_bigger_timeframes(candle, exchange, symbol, with_execution)
+            if with_generation and timeframe == "1m":
+                self.generate_bigger_timeframes(
+                    candle, exchange, symbol, with_execution
+                )
 
         # if it's the last candle again, update
         elif candle[0] == arr[-1][0]:
@@ -159,10 +170,13 @@ class CandlesState:
                 self.simulate_order_execution(exchange, symbol, timeframe, candle)
 
             arr[-1] = candle
+            should_heartbeat = True
 
             # regenerate other timeframes
-            if with_generation and timeframe == '1m':
-                self.generate_bigger_timeframes(candle, exchange, symbol, with_execution)
+            if with_generation and timeframe == "1m":
+                self.generate_bigger_timeframes(
+                    candle, exchange, symbol, with_execution
+                )
 
         # allow updating of the previous candle.
         elif candle[0] < arr[-1][0]:
@@ -176,10 +190,23 @@ class CandlesState:
                 f"Could not find the candle with timestamp {jh.timestamp_to_time(candle[0])} in the storage. Last candle's timestamp: {jh.timestamp_to_time(arr[-1])}. timeframe: {timeframe}, exchange: {exchange}, symbol: {symbol}"
             )
 
-    def _store_or_update_candle_into_db(self, exchange: str, symbol: str, timeframe: str, candle: np.ndarray) -> None:
+        if should_heartbeat and jh.is_live():
+            heartbeat.record_candle_heartbeat(
+                exchange=exchange,
+                symbol=symbol,
+                timeframe=timeframe,
+                candle_ts=int(candle[0]),
+                close_price=float(candle[2]),
+            )
+
+    def _store_or_update_candle_into_db(
+        self, exchange: str, symbol: str, timeframe: str, candle: np.ndarray
+    ) -> None:
         # if it's not an initial candle, add it to the storage, if already exists, update it
-        if f'{exchange}-{symbol}' in self.initiated_pairs:
-            store_candle_into_db(exchange, symbol, timeframe, candle, on_conflict='replace')
+        if f"{exchange}-{symbol}" in self.initiated_pairs:
+            store_candle_into_db(
+                exchange, symbol, timeframe, candle, on_conflict="replace"
+            )
 
     def add_candle_from_trade(self, trade, exchange: str, symbol: str) -> None:
         """
@@ -187,45 +214,47 @@ class CandlesState:
         those we have to use cases the trades stream
         """
         if not jh.is_live():
-            raise Exception('add_candle_from_trade() is for live modes only')
+            raise Exception("add_candle_from_trade() is for live modes only")
 
         # ignore if candle is still being initially imported
-        if f'{exchange}-{symbol}' not in self.initiated_pairs:
+        if f"{exchange}-{symbol}" not in self.initiated_pairs:
             return
 
         # update position's current price
-        self.update_position(exchange, symbol, trade['price'])
+        self.update_position(exchange, symbol, trade["price"])
 
         def do(t):
             # in some cases we might be missing the current forming candle like it is on FTX, hence
             # if that is the case, generate the current forming candle (it won't be super accurate)
             current_candle = self.get_current_candle(exchange, symbol, t)
             if jh.next_candle_timestamp(current_candle, t) < jh.now():
-                new_candle = self._generate_empty_candle_from_previous_candle(current_candle, t)
+                new_candle = self._generate_empty_candle_from_previous_candle(
+                    current_candle, t
+                )
                 self.add_candle(new_candle, exchange, symbol, t)
 
             current_candle = self.get_current_candle(exchange, symbol, t)
 
             new_candle = current_candle.copy()
             # close
-            new_candle[2] = trade['price']
+            new_candle[2] = trade["price"]
             # high
-            new_candle[3] = max(new_candle[3], trade['price'])
+            new_candle[3] = max(new_candle[3], trade["price"])
             # low
-            new_candle[4] = min(new_candle[4], trade['price'])
+            new_candle[4] = min(new_candle[4], trade["price"])
             # volume
-            new_candle[5] += trade['volume']
+            new_candle[5] += trade["volume"]
 
             self.add_candle(new_candle, exchange, symbol, t)
 
         # to support both candle generation and ...
-        if jh.get_config('env.data.generate_candles_from_1m'):
-            do('1m')
+        if jh.get_config("env.data.generate_candles_from_1m"):
+            do("1m")
         else:
             for ar in selectors.get_all_routes():
-                if ar['exchange'] != exchange or ar['symbol'] != symbol:
+                if ar["exchange"] != exchange or ar["symbol"] != symbol:
                     return
-                do(ar['timeframe'])
+                do(ar["timeframe"])
 
     @staticmethod
     def update_position(exchange: str, symbol: str, price: float) -> None:
@@ -237,58 +266,70 @@ class CandlesState:
             return
 
         if jh.is_live():
-            price_precision = selectors.get_exchange(exchange).vars['precisions'][symbol]['price_precision']
+            price_precision = selectors.get_exchange(exchange).vars["precisions"][
+                symbol
+            ]["price_precision"]
 
             # update position.current_price
             p.current_price = jh.round_price_for_live_mode(price, price_precision)
         else:
             p.current_price = price
 
-    def generate_bigger_timeframes(self, candle: np.ndarray, exchange: str, symbol: str, with_execution: bool) -> None:
+    def generate_bigger_timeframes(
+        self, candle: np.ndarray, exchange: str, symbol: str, with_execution: bool
+    ) -> None:
         if not jh.is_live():
             return
 
-        for timeframe in config['app']['considering_timeframes']:
+        for timeframe in config["app"]["considering_timeframes"]:
             # skip '1m'
-            if timeframe == '1m':
+            if timeframe == "1m":
                 continue
 
             last_candle = self.get_current_candle(exchange, symbol, timeframe)
             generate_from_count = int((candle[0] - last_candle[0]) / 60_000)
-            number_of_candles = len(self.get_candles(exchange, symbol, '1m'))
-            short_candles = self.get_candles(exchange, symbol, '1m')[-1 - generate_from_count:]
+            number_of_candles = len(self.get_candles(exchange, symbol, "1m"))
+            short_candles = self.get_candles(exchange, symbol, "1m")[
+                -1 - generate_from_count :
+            ]
 
             if generate_from_count == -1:
                 # it's receiving an slightly older candle than the last one. Ignore it
                 return
 
             if generate_from_count < 0:
-                current_1m = self.get_current_candle(exchange, symbol, '1m')
+                current_1m = self.get_current_candle(exchange, symbol, "1m")
                 raise ValueError(
-                    f'generate_from_count cannot be negative! '
-                    f'generate_from_count:{generate_from_count}, candle[0]:{candle[0]}, '
-                    f'last_candle[0]:{last_candle[0]}, current_1m:{current_1m[0]}, number_of_candles:{number_of_candles}')
+                    f"generate_from_count cannot be negative! "
+                    f"generate_from_count:{generate_from_count}, candle[0]:{candle[0]}, "
+                    f"last_candle[0]:{last_candle[0]}, current_1m:{current_1m[0]}, number_of_candles:{number_of_candles}"
+                )
 
             if len(short_candles) == 0:
                 raise ValueError(
-                    f'No candles were passed. More info:'
-                    f'\nexchange:{exchange}, symbol:{symbol}, timeframe:{timeframe}, generate_from_count:{generate_from_count}'
-                    f'\nlast_candle\'s timestamp: {last_candle[0]}'
-                    f'\ncurrent timestamp: {jh.now()}'
+                    f"No candles were passed. More info:"
+                    f"\nexchange:{exchange}, symbol:{symbol}, timeframe:{timeframe}, generate_from_count:{generate_from_count}"
+                    f"\nlast_candle's timestamp: {last_candle[0]}"
+                    f"\ncurrent timestamp: {jh.now()}"
                 )
 
             # update latest candle
             generated_candle = generate_candle_from_one_minutes(
-                timeframe,
-                short_candles,
-                accept_forming_candles=True
+                timeframe, short_candles, accept_forming_candles=True
             )
 
             self.add_candle(
-                generated_candle, exchange, symbol, timeframe, with_execution, with_generation=False
+                generated_candle,
+                exchange,
+                symbol,
+                timeframe,
+                with_execution,
+                with_generation=False,
             )
 
-    def simulate_order_execution(self, exchange: str, symbol: str, timeframe: str, new_candle: np.ndarray) -> None:
+    def simulate_order_execution(
+        self, exchange: str, symbol: str, timeframe: str, new_candle: np.ndarray
+    ) -> None:
         previous_candle = self.get_current_candle(exchange, symbol, timeframe)
         orders = selectors.get_orders(exchange, symbol)
 
@@ -301,25 +342,34 @@ class CandlesState:
                 continue
 
             if ((o.price >= previous_candle[2]) and (o.price <= new_candle[2])) or (
-                    (o.price <= previous_candle[2]) and (o.price >= new_candle[2])):
+                (o.price <= previous_candle[2]) and (o.price >= new_candle[2])
+            ):
                 o.execute()
 
     def batch_add_candle(
-            self,
-            candles: np.ndarray,
-            exchange: str,
-            symbol: str,
-            timeframe: str,
-            with_generation: bool = True
+        self,
+        candles: np.ndarray,
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        with_generation: bool = True,
     ) -> None:
         for c in candles:
-            self.add_candle(c, exchange, symbol, timeframe, with_execution=False, with_generation=with_generation, with_skip=False)
+            self.add_candle(
+                c,
+                exchange,
+                symbol,
+                timeframe,
+                with_execution=False,
+                with_generation=with_generation,
+                with_skip=False,
+            )
 
     def forming_estimation(self, exchange: str, symbol: str, timeframe: str) -> tuple:
         long_key = jh.key(exchange, symbol, timeframe)
-        short_key = jh.key(exchange, symbol, '1m')
+        short_key = jh.key(exchange, symbol, "1m")
         required_1m_to_complete_count = jh.timeframe_to_one_minutes(timeframe)
-        current_1m_count = len(self.get_storage(exchange, symbol, '1m'))
+        current_1m_count = len(self.get_storage(exchange, symbol, "1m"))
         dif = current_1m_count % required_1m_to_complete_count
         return dif, long_key, short_key
 
@@ -328,8 +378,8 @@ class CandlesState:
     # # # # # # # # #
     def get_candles(self, exchange: str, symbol: str, timeframe: str) -> np.ndarray:
         # no need to worry for forming candles when timeframe == 1m
-        if timeframe == '1m':
-            arr: DynamicNumpyArray = self.get_storage(exchange, symbol, '1m')
+        if timeframe == "1m":
+            arr: DynamicNumpyArray = self.get_storage(exchange, symbol, "1m")
             if len(arr) == 0:
                 return np.zeros((0, 6))
             else:
@@ -338,7 +388,7 @@ class CandlesState:
         # other timeframes
         dif, long_key, short_key = self.forming_estimation(exchange, symbol, timeframe)
         long_count = len(self.get_storage(exchange, symbol, timeframe))
-        short_count = len(self.get_storage(exchange, symbol, '1m'))
+        short_count = len(self.get_storage(exchange, symbol, "1m"))
 
         if dif == 0 and long_count == 0:
             return np.zeros((0, 6))
@@ -350,20 +400,30 @@ class CandlesState:
         elif not jh.is_live():
             forming_candle = generate_candle_from_one_minutes(
                 timeframe,
-                self.storage[short_key][short_count - dif:short_count],
-                True
+                self.storage[short_key][short_count - dif : short_count],
+                True,
             )
             existing_candles_arr: DynamicNumpyArray = self.storage[long_key]
-            self.add_candle(forming_candle, exchange, symbol, timeframe, with_execution=False, with_generation=False, with_skip=False)
+            self.add_candle(
+                forming_candle,
+                exchange,
+                symbol,
+                timeframe,
+                with_execution=False,
+                with_generation=False,
+                with_skip=False,
+            )
             return existing_candles_arr[:]
         # in live mode, just return the complete candles
         else:
             return self.storage[long_key][:long_count]
 
-    def get_current_candle(self, exchange: str, symbol: str, timeframe: str) -> np.ndarray:
+    def get_current_candle(
+        self, exchange: str, symbol: str, timeframe: str
+    ) -> np.ndarray:
         # no need to worry for forming candles when timeframe == 1m
-        if timeframe == '1m':
-            arr: DynamicNumpyArray = self.get_storage(exchange, symbol, '1m')
+        if timeframe == "1m":
+            arr: DynamicNumpyArray = self.get_storage(exchange, symbol, "1m")
             if len(arr) == 0:
                 return np.zeros((0, 6))
             else:
@@ -372,13 +432,14 @@ class CandlesState:
         # other timeframes
         dif, long_key, short_key = self.forming_estimation(exchange, symbol, timeframe)
         long_count = len(self.get_storage(exchange, symbol, timeframe))
-        short_count = len(self.get_storage(exchange, symbol, '1m'))
+        short_count = len(self.get_storage(exchange, symbol, "1m"))
 
         # forming candle
         if dif != 0:
             return generate_candle_from_one_minutes(
-                timeframe, self.storage[short_key][short_count - dif:short_count],
-                True
+                timeframe,
+                self.storage[short_key][short_count - dif : short_count],
+                True,
             )
         if long_count == 0:
             return np.zeros((0, 6))
@@ -392,9 +453,11 @@ class CandlesState:
         symbol: str,
     ) -> None:
         if not (jh.is_backtesting() or jh.is_optimizing()):
-            raise Exception('add_multiple_1m_candles() is for backtesting or optimizing only')
+            raise Exception(
+                "add_multiple_1m_candles() is for backtesting or optimizing only"
+            )
 
-        arr: DynamicNumpyArray = self.get_storage(exchange, symbol, '1m')
+        arr: DynamicNumpyArray = self.get_storage(exchange, symbol, "1m")
 
         # initial
         if len(arr) == 0:
@@ -413,4 +476,6 @@ class CandlesState:
 
         # Otherwise,it's true and error.
         else:
-            raise IndexError(f"Could not find the candle with timestamp {jh.timestamp_to_time(candles[0, 0])} in the storage. Last candle's timestamp: {jh.timestamp_to_time(arr[-1][0])}. exchange: {exchange}, symbol: {symbol}")
+            raise IndexError(
+                f"Could not find the candle with timestamp {jh.timestamp_to_time(candles[0, 0])} in the storage. Last candle's timestamp: {jh.timestamp_to_time(arr[-1][0])}. exchange: {exchange}, symbol: {symbol}"
+            )
